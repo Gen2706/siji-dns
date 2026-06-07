@@ -1,1 +1,1 @@
-# siji-DNS API package
+# siji-DNS API

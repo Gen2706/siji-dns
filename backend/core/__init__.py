@@ -1,1 +1,1 @@
-# siji-DNS Core package
+# siji-DNS Core
