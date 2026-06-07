@@ -2,10 +2,8 @@
 # ============================================================
 #  siji-DNS Installer — All-in-One
 #  Ubuntu 22.04 / 24.04 / Debian 12
-#  v2.0 — production ready, semua fix included
+#  v2.1 — semua fix included
 # ============================================================
-
-set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -30,13 +28,15 @@ banner() {
   echo "  ███████║██║╚█████╔╝╚█████╔╝       ██████╔╝██║ ╚████║███████║"
   echo "  ╚══════╝╚═╝ ╚════╝  ╚════╝        ╚═════╝ ╚═╝  ╚═══╝╚══════╝"
   echo -e "${NC}"
-  echo -e "  ${BOLD}siji-DNS v2.0${NC} — DNS Management Platform untuk ISP"
+  echo -e "  ${BOLD}siji-DNS v2.1${NC} — DNS Management Platform untuk ISP"
   echo -e "  Web Port: ${BOLD}${WEB_PORT}${NC}"
   echo ""
 }
 
 check_root() {
-  [[ $EUID -ne 0 ]] && error "Jalankan sebagai root: sudo bash install.sh"
+  if [[ $EUID -ne 0 ]]; then
+    error "Jalankan sebagai root: sudo bash install.sh"
+  fi
 }
 
 install_packages() {
@@ -47,7 +47,7 @@ install_packages() {
   apt-get install -y bind9 bind9utils bind9-doc dnsutils
 
   info "Install Unbound..."
-  apt-get install -y unbound
+  apt-get install -y unbound || true
 
   info "Install Python3..."
   apt-get install -y python3 python3-pip python3-venv
@@ -56,7 +56,7 @@ install_packages() {
   apt-get install -y nginx
 
   info "Install tools tambahan..."
-  apt-get install -y openssl curl wget git sqlite3
+  apt-get install -y openssl curl wget git sqlite3 rsync
 
   # dnsdist opsional
   apt-get install -y dnsdist 2>/dev/null && success "dnsdist terinstall" || \
@@ -89,7 +89,6 @@ setup_dirs() {
   chown -R bind:bind /etc/bind/zones /etc/bind/keys /var/log/named /var/cache/bind 2>/dev/null || true
   chmod 755 /etc/bind/zones /etc/bind/keys /var/log/named
 
-  # Buat log file untuk BIND9
   touch /var/log/named/named.log
   chown bind:bind /var/log/named/named.log
 
@@ -119,8 +118,10 @@ WSGI
 configure_bind() {
   info "Konfigurasi BIND9..."
 
-  [[ -f /etc/bind/named.conf.options ]] && \
+  # Backup config lama
+  if [[ -f /etc/bind/named.conf.options ]]; then
     cp /etc/bind/named.conf.options "/etc/bind/named.conf.options.bak.$(date +%s)" 2>/dev/null || true
+  fi
 
   cat > /etc/bind/named.conf.options << 'BINDCONF'
 // siji-DNS managed options
@@ -141,7 +142,6 @@ options {
 };
 BINDCONF
 
-  # named.conf.local dengan logging
   cat > /etc/bind/named.conf.local << 'LOCALCONF'
 // siji-DNS managed zones
 
@@ -155,7 +155,6 @@ logging {
 };
 LOCALCONF
 
-  # Aktifkan query logging
   systemctl enable named 2>/dev/null || systemctl enable bind9 2>/dev/null || true
   systemctl restart named 2>/dev/null || systemctl restart bind9 2>/dev/null || true
 
@@ -170,6 +169,7 @@ LOCALCONF
 configure_unbound() {
   info "Konfigurasi Unbound..."
 
+  # Tulis config tanpa include-if-possible (tidak didukung semua versi)
   cat > /etc/unbound/unbound.conf << 'UNBOUNDCONF'
 server:
     interface: 127.0.0.2
@@ -186,19 +186,24 @@ server:
     cache-min-ttl: 0
     cache-max-ttl: 86400
     num-threads: 2
-
-    include-if-possible: /etc/siji-dns/blocklists/compiled/unbound-local.conf
 UNBOUNDCONF
 
-  systemctl enable unbound
-  systemctl restart unbound
+  systemctl enable unbound || true
+  systemctl restart unbound || true
+
   sleep 1
-  systemctl is-active unbound &>/dev/null && success "Unbound aktif" || \
+  if systemctl is-active unbound &>/dev/null; then
+    success "Unbound aktif"
+  else
     warn "Unbound gagal start — cek: journalctl -u unbound"
+  fi
 }
 
 configure_dnsdist() {
-  command -v dnsdist &>/dev/null || { warn "dnsdist tidak terinstall, skip"; return; }
+  if ! command -v dnsdist &>/dev/null; then
+    warn "dnsdist tidak terinstall, skip"
+    return
+  fi
   info "Konfigurasi dnsdist..."
   mkdir -p /etc/dnsdist
   cat > /etc/dnsdist/dnsdist.conf << 'DNSDISTCONF'
@@ -287,21 +292,19 @@ NGINXEOF
 
   ln -sf /etc/nginx/sites-available/siji-dns /etc/nginx/sites-enabled/siji-dns
   rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-  nginx -t && systemctl restart nginx
-  systemctl is-active nginx &>/dev/null && success "Nginx aktif di port $WEB_PORT" || \
-    warn "Nginx gagal start"
+  nginx -t && systemctl restart nginx || warn "Nginx gagal start"
+  systemctl is-active nginx &>/dev/null && success "Nginx aktif di port $WEB_PORT"
 }
 
 setup_firewall() {
   if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
     info "Konfigurasi UFW firewall..."
-    ufw allow 22/tcp    comment "SSH"       2>/dev/null || true
-    ufw allow 53/tcp    comment "DNS TCP"   2>/dev/null || true
-    ufw allow 53/udp    comment "DNS UDP"   2>/dev/null || true
-    ufw allow 80/tcp    comment "HTTP"      2>/dev/null || true
-    ufw allow 443/tcp   comment "HTTPS"     2>/dev/null || true
-    ufw allow 853/tcp   comment "DoT"       2>/dev/null || true
-    ufw allow $WEB_PORT/tcp comment "siji-DNS Web" 2>/dev/null || true
+    ufw allow 22/tcp    comment "SSH"            2>/dev/null || true
+    ufw allow 53/tcp    comment "DNS TCP"        2>/dev/null || true
+    ufw allow 53/udp    comment "DNS UDP"        2>/dev/null || true
+    ufw allow 443/tcp   comment "HTTPS"          2>/dev/null || true
+    ufw allow 853/tcp   comment "DoT"            2>/dev/null || true
+    ufw allow $WEB_PORT/tcp comment "siji-DNS"   2>/dev/null || true
     success "Firewall dikonfigurasi"
   fi
 }
@@ -312,7 +315,7 @@ start_services() {
   systemctl enable siji-dns-api siji-dns-logger
   systemctl restart siji-dns-api
   sleep 3
-  systemctl start siji-dns-logger
+  systemctl start siji-dns-logger || true
   success "Semua service dijalankan"
 }
 
@@ -320,7 +323,7 @@ print_summary() {
   SERVER_IP=$(hostname -I | awk '{print $1}')
   echo ""
   echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════${NC}"
-  echo -e "${BOLD}  siji-DNS v2.0 berhasil diinstall!${NC}"
+  echo -e "${BOLD}  siji-DNS v2.1 berhasil diinstall!${NC}"
   echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
   echo ""
   echo -e "  ${BOLD}Web Interface:${NC}  http://${SERVER_IP}:${WEB_PORT}"
@@ -328,15 +331,17 @@ print_summary() {
   echo ""
   echo -e "  ${BOLD}Status Layanan:${NC}"
   for svc in named bind9; do
-    systemctl is-active $svc &>/dev/null && \
-      echo -e "    ${GREEN}✓${NC} BIND9 ($svc)" && break
+    if systemctl is-active $svc &>/dev/null; then
+      echo -e "    ${GREEN}✓${NC} BIND9 ($svc)"
+      break
+    fi
   done
-  systemctl is-active unbound       &>/dev/null && echo -e "    ${GREEN}✓${NC} Unbound" || echo -e "    ${RED}✗${NC} Unbound"
-  systemctl is-active siji-dns-api  &>/dev/null && echo -e "    ${GREEN}✓${NC} siji-DNS API" || echo -e "    ${RED}✗${NC} siji-DNS API"
-  systemctl is-active siji-dns-logger &>/dev/null && echo -e "    ${GREEN}✓${NC} siji-DNS Logger" || echo -e "    ${RED}✗${NC} Logger"
-  systemctl is-active nginx         &>/dev/null && echo -e "    ${GREEN}✓${NC} Nginx" || echo -e "    ${RED}✗${NC} Nginx"
+  systemctl is-active unbound          &>/dev/null && echo -e "    ${GREEN}✓${NC} Unbound"        || echo -e "    ${RED}✗${NC} Unbound"
+  systemctl is-active siji-dns-api     &>/dev/null && echo -e "    ${GREEN}✓${NC} siji-DNS API"   || echo -e "    ${RED}✗${NC} siji-DNS API"
+  systemctl is-active siji-dns-logger  &>/dev/null && echo -e "    ${GREEN}✓${NC} Query Logger"   || echo -e "    ${RED}✗${NC} Query Logger"
+  systemctl is-active nginx            &>/dev/null && echo -e "    ${GREEN}✓${NC} Nginx"          || echo -e "    ${RED}✗${NC} Nginx"
   echo ""
-  echo -e "  ${BOLD}Ganti port web (opsional):${NC}"
+  echo -e "  ${BOLD}Ganti port (opsional):${NC}"
   echo -e "  SIJI_PORT=8080 bash install.sh"
   echo ""
   echo -e "  ${BOLD}⚠ Segera ganti password default!${NC}"
